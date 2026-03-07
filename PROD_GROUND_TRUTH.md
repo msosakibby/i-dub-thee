@@ -41074,76 +41074,91 @@ c.save()
 
 ### FILE: ./layer1_intake/main.py
 ```
-import os, json, re, functions_framework
+import functions_framework
+import os
+import json
+import re
 from google.cloud import storage
-from pydantic import BaseModel, Field
-from google import genai
-from google.genai import types
+import vertexai
+from vertexai.generative_models import GenerativeModel, Part
 
-ENTITY_ALIAS_MAP = {
-  "Judith Grandy": ["A GRANDY", "JA GRANDY", "JOYCE A GRANDY", "JUDITH A GRANDY", "JUDITH A GRANDY TTEE", "JUDITH A KIBBY", "JUDITH ANN GRANDY", "JUDITH GRANDY", "JUDITH KIBBY", "JUDITH KLHHY", "JUDITHA GRANDY", "JUDITHANN GRANDY", "JUDY GRANDY", "JUDY KIBBY", "JUDITH A KIBBY GRANDY", "JUDY", "MRS JUDITH A GRANDY"],
-  "Keith Grandy": ["GRANDY KEITH ARTHUR", "GRANDY KIETH", "K GRANDY", "KEITH A GRANDY", "KEITH ARTHUR GRANDY", "KEITH GRANDY", "KATH GRANELY"],
-  "KibbyCo": ["KIBBY CO", "KIBBY COMPANY", "KIBBY COMPANY LLC"],
-  "K Grandy Enterprises": ["K GRANDY ENTERPRISES LLC"],
-  "Max R Kibby Trust": ["MAX R KIBBY"]
-}
+PROJECT_ID = os.environ.get("GCP_PROJECT", "i-dub-thee")
+PROCESSED_BUCKET = os.environ.get("PROCESSED_BUCKET", f"{PROJECT_ID}-processed")
+QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", f"{PROJECT_ID}-quarantine")
 
-REJECT_PATTERN = re.compile(r'(?i)\b(Mark Kibby|Mark Sosa-Kibby|Mark William Sosa|Mark Willliam Sosa|Mark W Kibby|Parker Sosa-Kibby|Cole Sosa-Kibby|Erik Sosa-Kibby|Parker|Cole|Erik)\b')
+storage_client = storage.Client(project=PROJECT_ID)
+vertexai.init(project=PROJECT_ID, location="us-central1")
+model = GenerativeModel("gemini-2.5-pro")
 
-def normalize_entity_name(raw_name):
-    upper_name = raw_name.upper().strip()
-    for canonical, aliases in ENTITY_ALIAS_MAP.items():
-        if upper_name in aliases: return canonical
-    return raw_name.strip()
+def sanitize_path_string(text: str) -> str:
+    if not text: return "UNKNOWN"
+    return re.sub(r'[\\/:*?"<>|]', '_', str(text)).strip()
 
-def sanitize_path(text): return re.sub(r'[\\/:*?"<>|]', '_', text).strip()
+def build_standardized_event_name(doc_date: str, primary_subject: str, entity: str, classification: str, institution: str, ref_id: str) -> str:
+    base = f"{doc_date} - {primary_subject} - {entity} - {classification} - {institution}"
+    if ref_id.upper() != "NONE" and ref_id:
+        return f"{base} - {ref_id}"
+    return base
 
-class Layer1RoutingSchema(BaseModel):
-    document_date: str = Field(description="YYYY-MM-DD. If unknown, use 1900-01-01.")
-    primary_subject: str = Field(description="Exact individual or business entity name.")
-    document_classification: str = Field(description="e.g., 'Bank Statement', 'Utility Bill'.")
-    institution_name: str = Field(description="e.g., 'Horizon Bank', 'Great Lakes Energy'.")
-    primary_reference_id: str = Field(description="Last 4 digits of account, or full invoice number. Or 'NONE'.")
-    recommended_18_lane_id: str = Field(description="e.g., 'LANE_04_BANKING'. If unknown, 'LANE_99_UNKNOWN'.")
-    confidence_score: float = Field(description="Confidence from 0.0 to 1.0.")
-
-def move_blob(bucket, source, dest_bucket, dest_name):
-    sc = storage.Client()
-    sb = sc.bucket(bucket)
-    sc.bucket(dest_bucket).copy_blob(sb.blob(source), sc.bucket(dest_bucket), dest_name)
-    sb.blob(source).delete()
+def build_deep_geometric_path(lane: str, entity: str, institution: str, event_name: str) -> str:
+    return f"{sanitize_path_string(lane)}/{sanitize_path_string(entity)}/{sanitize_path_string(institution)}/{sanitize_path_string(event_name)}/{sanitize_path_string(event_name)}.pdf"
 
 @functions_framework.cloud_event
-def process_document(cloud_event):
+def process_intake(cloud_event):
     data = cloud_event.data
-    if "input/" not in data["name"]: return
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT_ID", "i-dub-thee")
-    blob = storage.Client().bucket(data["bucket"]).blob(data["name"])
+    bucket_name = data["bucket"]
+    file_name = data["name"]
+    
+    intake_bucket = storage_client.bucket(bucket_name)
+    intake_blob = intake_bucket.blob(file_name)
+    temp_path = f"/tmp/{file_name.replace('/', '_')}"
+    intake_blob.download_to_filename(temp_path)
+    document_part = Part.from_uri(f"gs://{bucket_name}/{file_name}", mime_type="application/pdf")
+    
+    prompt = """
+    Analyze this document and extract the exact routing variables. Output strictly as JSON:
+    - document_date (YYYY-MM-DD)
+    - primary_subject (Raw name on document)
+    - normalized_entity (Canonical name)
+    - document_classification
+    - institution_name
+    - primary_reference_id (or "NONE")
+    - recommended_18_lane_id
+    """
+    
     try:
-        file_bytes = blob.download_as_bytes()
-        if not file_bytes.startswith(b'%PDF'): raise ValueError("Invalid PDF.")
+        response = model.generate_content([document_part, prompt])
+        routing_data = json.loads(response.text.replace("```json", "").replace("```", "").strip())
         
-        client = genai.Client(http_options={'api_version': 'v1beta1'}, vertexai=True, project=project_id, location="us-central1")
-        pdf_part = types.Part.from_bytes(data=file_bytes, mime_type='application/pdf')
-        config = types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json", response_schema=Layer1RoutingSchema)
+        event_name = build_standardized_event_name(
+            sanitize_path_string(routing_data.get("document_date", "UNKNOWN")),
+            sanitize_path_string(routing_data.get("primary_subject", "UNKNOWN")),
+            sanitize_path_string(routing_data.get("normalized_entity", "UNKNOWN")),
+            sanitize_path_string(routing_data.get("document_classification", "UNKNOWN")),
+            sanitize_path_string(routing_data.get("institution_name", "UNKNOWN")),
+            sanitize_path_string(routing_data.get("primary_reference_id", "NONE"))
+        )
         
-        res = client.models.generate_content(model="gemini-2.5-pro", contents=[pdf_part, "Extract routing variables."], config=config)
-        res_data = json.loads(res.text)
-
-        raw_sub = sanitize_path(res_data["primary_subject"])
-        if REJECT_PATTERN.search(raw_sub): raise ValueError(f"FIREWALL_TRIGGERED: '{raw_sub}' is restricted.")
-        if res_data["confidence_score"] < 0.90: raise ValueError("Low Confidence.")
-            
-        norm_ent = normalize_entity_name(raw_sub)
-        evt_name = f"{sanitize_path(res_data['document_date'])} - {raw_sub} - {norm_ent} - {sanitize_path(res_data['document_classification'])} - {sanitize_path(res_data['institution_name'])}"
-        ref_id = sanitize_path(res_data['primary_reference_id'])
-        if ref_id.upper() != "NONE": evt_name += f" - {ref_id}"
+        deep_path = build_deep_geometric_path(
+            routing_data.get("recommended_18_lane_id", "UNKNOWN_LANE"),
+            routing_data.get("normalized_entity", "UNKNOWN"),
+            routing_data.get("institution_name", "UNKNOWN"),
+            event_name
+        )
         
-        dest_path = f"{res_data['recommended_18_lane_id']}/{norm_ent}/{sanitize_path(res_data['institution_name'])}/{evt_name}/{evt_name}.pdf"
-        move_blob(data["bucket"], data["name"], "i-dub-thee-processed", dest_path)
+        processed_bucket = storage_client.bucket(PROCESSED_BUCKET)
+        new_blob = processed_bucket.blob(deep_path)
+        new_blob.upload_from_filename(temp_path)
+        intake_blob.delete()
+        print(f"[SUCCESS] Vaulted to: {deep_path}")
+        
     except Exception as e:
-        print(f"[QUARANTINE] {str(e)}")
-        move_blob(data["bucket"], data["name"], "i-dub-thee-quarantine", data["name"].replace("input/", ""))
+        print(f"[FATAL] Routing to Quarantine: {e}")
+        quarantine_bucket = storage_client.bucket(QUARANTINE_BUCKET)
+        quarantine_bucket.blob(f"failed_intake/{file_name}").upload_from_filename(temp_path)
+        intake_blob.delete()
+    finally:
+        if os.path.exists(temp_path): os.remove(temp_path)
 
 ```
 
@@ -41151,8 +41166,7 @@ def process_document(cloud_event):
 ```
 functions-framework==3.5.0
 google-cloud-storage==2.14.0
-pydantic==2.6.3
-google-genai==0.3.0
+google-cloud-aiplatform==1.42.1
 
 ```
 
@@ -41569,6 +41583,103 @@ def test_idempotency_suspension():
     # Mathematically prove the BQ client was never called during sandbox mode
     assert mock_bq_client.query.call_count == 1 # Only called once by the Prod test
 
+
+```
+
+### FILE: ./layer3_bucket_trigger/main.py
+```
+import functions_framework
+import os
+import json
+from google.cloud import storage, bigquery
+import vertexai
+from vertexai.generative_models import GenerativeModel
+from schema_context import FLAT_SCHEMA_DDL
+
+PROJECT_ID = os.environ.get("GCP_PROJECT", "i-dub-thee")
+RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", f"{PROJECT_ID}-dev-results")
+
+storage_client = storage.Client(project=PROJECT_ID)
+bq_client = bigquery.Client(project=PROJECT_ID)
+vertexai.init(project=PROJECT_ID, location="us-central1")
+model = GenerativeModel("gemini-2.5-pro")
+
+@functions_framework.cloud_event
+def process_query(cloud_event):
+    data = cloud_event.data
+    bucket_name = data["bucket"]
+    file_name = data["name"]
+    
+    print(f"[SYSTEM] Wake event received. Reading hypothesis from: gs://{bucket_name}/{file_name}")
+    
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(file_name)
+    hypothesis = blob.download_as_text().strip()
+    
+    prompt = f"""
+    You are a forensic legal data engineer. 
+    Your ONLY job is to translate the user's natural language hypothesis into a BigQuery SQL statement.
+    STRICT LAWS:
+    1. ONLY output raw, executable BigQuery SQL. No markdown, no formatting.
+    2. STRICTLY FORBIDDEN: DROP, DELETE, UPDATE, INSERT, ALTER.
+    3. You may ONLY use the tables and columns defined in this schema:
+    {FLAT_SCHEMA_DDL}
+    Hypothesis: {hypothesis}
+    """
+    
+    response = model.generate_content(prompt)
+    clean_sql = response.text.replace("```sql", "").replace("```", "").strip()
+    
+    upper_sql = clean_sql.upper()
+    for cmd in ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER"]:
+        if cmd in upper_sql:
+            print(f"[FATAL] SECURITY BREACH: Destructive command blocked ({cmd}).")
+            return
+            
+    print(f"[SYSTEM] Executing SQL translated logic...")
+    query_job = bq_client.query(clean_sql)
+    results = [dict(row) for row in query_job.result()]
+    
+    out_bucket = storage_client.bucket(RESULTS_BUCKET)
+    out_blob = out_bucket.blob(f"evidence_report_{file_name.replace('.txt', '.json')}")
+    out_blob.upload_from_string(json.dumps(results, indent=2, default=str))
+    
+    print(f"[SUCCESS] Evidence packaged and written to: gs://{RESULTS_BUCKET}/{out_blob.name}")
+
+```
+
+### FILE: ./layer3_bucket_trigger/requirements.txt
+```
+functions-framework==3.5.0
+google-cloud-storage==2.14.0
+google-cloud-bigquery==3.17.2
+google-cloud-aiplatform==1.42.1
+
+```
+
+### FILE: ./layer3_bucket_trigger/schema_context.py
+```
+FLAT_SCHEMA_DDL = """
+-- THIS IS THE WORM-COMPLIANT FLAT FACT BASE.
+-- DO NOT HALLUCINATE COLUMNS. YOU MAY ONLY USE THE FIELDS BELOW.
+
+TABLE: `forensic_fact_base_dev.ingestion_ledger`
+DESCRIPTION: Raw, flat JSON extracted evidence.
+COLUMNS:
+- dossier_id (STRING): The unique ID of the document.
+- extraction_timestamp (TIMESTAMP): When it was ingested.
+- extracted_payload (JSON): The ZERO-OMISSION FLAT JSON payload.
+    - Keys include: 'activity_line_01_description', 'activity_line_01_amount', etc.
+
+TABLE: `forensic_fact_base_dev.hypothesis_outcomes`
+DESCRIPTION: The output of the forensic rules engine.
+COLUMNS:
+- outcome_id (STRING): Unique ID for the evaluation.
+- dossier_id (STRING): Links back to the ingestion_ledger.
+- rule_id (STRING): The legal rule evaluated (e.g., 'PARAGRAPH_8F_M_AND_J').
+- violation_detected (BOOLEAN): TRUE if commingling or violation occurred.
+- matched_evidence (JSON): The specific flat JSON key/value that triggered the rule.
+"""
 
 ```
 
@@ -46249,6 +46360,95 @@ def forensic_hypothesis_trigger(cloud_event) -> None:
 
 ```
 
+### FILE: ./src/ingestion_router.py
+```
+import os
+import json
+import uuid
+import hashlib
+from datetime import datetime, timezone
+from google.cloud import bigquery, storage
+from src.schemas import FlatForensicPayload, ValidationError
+
+class WORM_IngestionRouter:
+    def __init__(self):
+        self.project_id = os.environ.get("GCP_PROJECT", "i-dub-thee")
+        self.bq_client = bigquery.Client(project=self.project_id)
+        self.storage_client = storage.Client(project=self.project_id)
+        
+        # Physical Vault Locations
+        self.ledger_table = f"{self.project_id}.forensic_fact_base_dev.ingestion_ledger"
+        self.quarantine_bucket_name = f"{self.project_id}-dev-quarantine"
+
+    def process_payload(self, raw_json_dict: dict):
+        try:
+            # 1. Attempt Iron Gate Validation
+            validated = FlatForensicPayload(**raw_json_dict)
+            
+            # 2. Package for BigQuery WORM Insertion
+            row_to_insert = {
+                "dossier_id": validated.dossier_id,
+                "extraction_timestamp": validated.extraction_timestamp.isoformat(),
+                "extracted_payload": validated.model_dump_json() # Store the entire flat JSON
+            }
+            
+            print(f"\n[SYSTEM] Transmitting Valid Payload to BigQuery WORM Vault...")
+            errors = self.bq_client.insert_rows_json(self.ledger_table, [row_to_insert])
+            
+            if errors:
+                raise Exception(f"BigQuery WORM Insertion Failed: {errors}")
+                
+            print(f"[SUCCESS] Event ID {validated.ingestion_event_id} securely vaulted.")
+            return {"status": "INGESTED", "hash": validated.cryptographic_sha256_hash}
+            
+        except ValidationError as e:
+            # 3. Mathematical Quarantine (Zero Deletion)
+            quarantine_uuid = str(uuid.uuid4())
+            raw_serialized = json.dumps(raw_json_dict, sort_keys=True, default=str)
+            quarantine_hash = hashlib.sha256(raw_serialized.encode('utf-8')).hexdigest()
+            
+            quarantine_dossier = {
+                "quarantine_event_id": quarantine_uuid,
+                "quarantine_timestamp": datetime.now(timezone.utc).isoformat(),
+                "original_payload_hash": quarantine_hash,
+                "pydantic_violation_log": e.errors(),
+                "raw_rejected_payload": raw_json_dict
+            }
+            
+            print(f"\n[BLOCKED] Nested/Invalid Data Intercepted. Routing to WORM Quarantine...")
+            bucket = self.storage_client.bucket(self.quarantine_bucket_name)
+            blob = bucket.blob(f"quarantine_event_{quarantine_uuid}.json")
+            blob.upload_from_string(json.dumps(quarantine_dossier, indent=2))
+            
+            print(f"[QUARANTINE SUCCESS] WORM Hash securely vaulted: {quarantine_hash}")
+            return {"status": "QUARANTINED", "quarantine_id": quarantine_uuid}
+
+if __name__ == "__main__":
+    router = WORM_IngestionRouter()
+    
+    print("\n============================================================================")
+    print(" INITIATING LIVE FIRE PHYSICAL ROUTING TEST")
+    print("============================================================================")
+    
+    # Simulate a clean optical extraction from Layer 1
+    valid_data = {
+        "dossier_id": f"DOSS-{uuid.uuid4().hex[:6].upper()}",
+        "activity_line_01_description_value": "M & J Food Market Wire Transfer",
+        "activity_line_01_description_confidence": 0.99,
+        "activity_line_01_amount_value": 50000.00,
+        "activity_line_01_amount_confidence": 0.95
+    }
+    router.process_payload(valid_data)
+    
+    # Simulate a nested LLM hallucination attack
+    invalid_data = {
+        "dossier_id": f"DOSS-{uuid.uuid4().hex[:6].upper()}",
+        "nested_hallucination": {"amount": 50000.00}
+    }
+    router.process_payload(invalid_data)
+
+```
+
 ### FILE: ./src/__init__.py
 ```
 
@@ -46529,18 +46729,36 @@ COLUMNS:
 
 ### FILE: ./src/schemas.py
 ```
-from pydantic import BaseModel, Field
-from typing import Dict, Any
+import json
+import hashlib
+import uuid
+from pydantic import BaseModel, Field, model_validator, ValidationError
+from typing import Optional
+from datetime import datetime, timezone
 
-class ForensicGoldenEnvelope(BaseModel):
-    """
-    The Daubert-admissible container for extracted forensic data.
-    Enforces the presence of spatial anchors and confidence scores.
-    """
-    document_type: str = Field(..., description="The explicit 18-Lane Taxonomy document type.")
-    confidence_score: float = Field(..., ge=0.0, le=1.0, description="AI confidence score for the extraction.")
-    spatial_anchor_uri: str = Field(..., description="GCS URI or bounding box proving provenance.")
-    extracted_data: Dict[str, Any] = Field(..., description="The exhaustive, unsummarized JSON payload.")
+class FlatForensicPayload(BaseModel):
+    dossier_id: str = Field(..., description="Binding to the original WORM PDF.")
+    extraction_timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    ingestion_event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    cryptographic_sha256_hash: str = Field(default="")
+    
+    activity_line_01_description_value: Optional[str] = None
+    activity_line_01_description_confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    activity_line_01_amount_value: Optional[float] = None
+    activity_line_01_amount_confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    
+    aicpa_compliant: bool = True
+
+    @model_validator(mode='after')
+    def author_hash_and_compliance(self) -> 'FlatForensicPayload':
+        for field_name, value in self.__dict__.items():
+            if field_name.endswith('_confidence') and value is not None and value < 0.90:
+                self.aicpa_compliant = False
+        payload_dict = self.model_dump(exclude={'cryptographic_sha256_hash'})
+        self.cryptographic_sha256_hash = hashlib.sha256(json.dumps(payload_dict, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+        return self
+
+    model_config = {"extra": "forbid"}
 
 ```
 
@@ -51257,6 +51475,13 @@ echo " TRANSITION COMPLETE: ENVIRONMENT IS PRISTINE AND READY FOR PLATINUM CODE 
 echo "============================================================================"
 ```
 
+### FILE: ./.vscode/settings.json
+```
+{
+    "git.ignoreLimitWarning": true
+}
+```
+
 
 ## 2. GOOGLE CLOUD STORAGE CONFIGURATION
 ```yaml
@@ -51266,6 +51491,12 @@ name: gcf-v2-sources-110409945269-us-central1
 ---
 location: US-CENTRAL1
 name: gcf-v2-uploads-110409945269.us-central1.cloudfunctions.appspot.com
+---
+location: US-CENTRAL1
+name: i-dub-thee-dev-queries
+---
+location: US-CENTRAL1
+name: i-dub-thee-dev-results
 ---
 location: US-CENTRAL1
 name: i-dub-thee-docs
@@ -51394,67 +51625,73 @@ serviceConfig:
 bindings:
   members: serviceAccount:forensic-engine-sa@i-dub-thee.iam.gserviceaccount.com
   role: roles/aiplatform.user
-etag: BwZL4OH8t4Y=
+etag: BwZMc-FozYY=
 version: 1
 ---
 bindings:
   members: serviceAccount:forensic-engine-sa-dev@i-dub-thee.iam.gserviceaccount.com
   role: roles/bigquery.dataEditor
-etag: BwZL4OH8t4Y=
+etag: BwZMc-FozYY=
 version: 1
 ---
 bindings:
   members: serviceAccount:forensic-engine-sa@i-dub-thee.iam.gserviceaccount.com
   role: roles/bigquery.dataEditor
-etag: BwZL4OH8t4Y=
+etag: BwZMc-FozYY=
 version: 1
 ---
 bindings:
   members: serviceAccount:forensic-engine-sa-dev@i-dub-thee.iam.gserviceaccount.com
   role: roles/bigquery.jobUser
-etag: BwZL4OH8t4Y=
+etag: BwZMc-FozYY=
 version: 1
 ---
 bindings:
   members: serviceAccount:forensic-engine-sa@i-dub-thee.iam.gserviceaccount.com
   role: roles/bigquery.jobUser
-etag: BwZL4OH8t4Y=
+etag: BwZMc-FozYY=
 version: 1
 ---
 bindings:
   members: serviceAccount:forensic-engine-sa@i-dub-thee.iam.gserviceaccount.com
   role: roles/documentai.apiUser
-etag: BwZL4OH8t4Y=
+etag: BwZMc-FozYY=
+version: 1
+---
+bindings:
+  members: serviceAccount:forensic-engine-sa-dev@i-dub-thee.iam.gserviceaccount.com
+  role: roles/eventarc.eventReceiver
+etag: BwZMc-FozYY=
 version: 1
 ---
 bindings:
   members: serviceAccount:forensic-engine-sa@i-dub-thee.iam.gserviceaccount.com
   role: roles/eventarc.eventReceiver
-etag: BwZL4OH8t4Y=
+etag: BwZMc-FozYY=
 version: 1
 ---
 bindings:
   members: serviceAccount:forensic-engine-sa@i-dub-thee.iam.gserviceaccount.com
   role: roles/logging.logWriter
-etag: BwZL4OH8t4Y=
+etag: BwZMc-FozYY=
 version: 1
 ---
 bindings:
   members: serviceAccount:forensic-engine-sa@i-dub-thee.iam.gserviceaccount.com
   role: roles/run.invoker
-etag: BwZL4OH8t4Y=
+etag: BwZMc-FozYY=
 version: 1
 ---
 bindings:
   members: serviceAccount:forensic-engine-sa@i-dub-thee.iam.gserviceaccount.com
   role: roles/storage.admin
-etag: BwZL4OH8t4Y=
+etag: BwZMc-FozYY=
 version: 1
 ---
 bindings:
   members: serviceAccount:forensic-engine-sa@i-dub-thee.iam.gserviceaccount.com
   role: roles/storage.objectAdmin
-etag: BwZL4OH8t4Y=
+etag: BwZMc-FozYY=
 version: 1
 
 ```
