@@ -1,0 +1,10 @@
+from reportlab.pdfgen import canvas
+c = canvas.Canvas("clean_receipt.pdf")
+c.setFont("Helvetica-Bold", 16)
+c.drawString(100, 750, "M & J FOOD MARKET - CLEAN RECEIPT")
+c.setFont("Helvetica", 12)
+c.drawString(100, 710, "Transaction Date: 2026-02-26")
+c.drawString(100, 690, "Payment Method: Corporate Credit Card")
+c.drawString(100, 670, "Total Amount: $150.00")
+c.drawString(100, 650, "Notes: Standard office supplies.")
+c.save()

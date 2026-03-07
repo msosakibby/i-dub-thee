@@ -1,0 +1,32 @@
+# Security Failsafes
+.env
+credentials.json
+*.json
+
+# Allow specific required JSON schemas
+!bq_schema.json
+!bq_alias_schema.json
+
+# Virtual Environments
+.venv*/
+forensic_env/
+env/
+venv/
+
+# Cache & Compiled Code
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE & OS Files
+.vscode/
+.DS_Store
+
+# Large Artifacts
+*.zip
+*.pdf
+*.log
+
+# Deployment Chambers
+staging_deployment_chamber/
+pristine_deployment_chamber/

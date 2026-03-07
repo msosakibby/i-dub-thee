@@ -1,0 +1,5 @@
+[
+  {"name": "raw_institution", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "raw_account_suffix", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "canonical_entity_id", "type": "STRING", "mode": "REQUIRED"}
+]

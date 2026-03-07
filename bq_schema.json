@@ -1,0 +1,12 @@
+[
+  {"name": "parent_file_hash", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "gcs_source_uri", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "taxonomy_lane", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "entity_slug", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "document_type", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "document_date", "type": "DATE", "mode": "NULLABLE"},
+  {"name": "confidence_score", "type": "FLOAT64", "mode": "REQUIRED"},
+  {"name": "requires_manual_review", "type": "BOOLEAN", "mode": "REQUIRED"},
+  {"name": "evidence_coordinates", "type": "JSON", "mode": "NULLABLE"},
+  {"name": "extracted_payload", "type": "JSON", "mode": "REQUIRED"}
+]

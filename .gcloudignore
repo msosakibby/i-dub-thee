@@ -1,0 +1,23 @@
+# Strict Cloud Build Exclusion Ledger
+.gcloudignore
+.git
+.gitignore
+
+# 1. Quarantine Local Virtual Environments (The Root Cause)
+forensic_env/
+venv/
+env/
+.venv/
+
+# 2. Quarantine Cache & Adversarial TDD Payloads
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+golden_test_registry.json
+
+# 3. Quarantine Deployment Executables
+deploy_dev.sh
+deploy_prod.sh
+provision_dev_infrastructure.sh
+patch_developer_iam.sh

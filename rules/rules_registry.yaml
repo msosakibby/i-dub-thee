@@ -1,0 +1,20 @@
+rules:
+  - rule_id: "PARAGRAPH_8F_M_AND_J"
+    description: "Flags commingling of M & J Food Market assets as Separate Property."
+    condition:
+      field_target: "description"
+      operator: "CONTAINS"
+      value: "M & J Food Market"
+    outcome:
+      tag: "SEPARATE_PROPERTY_SHIELD"
+      requires_manual_review: true
+
+  - rule_id: "PARAGRAPH_6_KIBBY_LLC"
+    description: "Flags Kibby Company LLC transactions for Paragraph 6 compliance."
+    condition:
+      field_target: "description"
+      operator: "CONTAINS"
+      value: "Kibby Company LLC"
+    outcome:
+      tag: "PARAGRAPH_6_VIOLATION"
+      requires_manual_review: true
